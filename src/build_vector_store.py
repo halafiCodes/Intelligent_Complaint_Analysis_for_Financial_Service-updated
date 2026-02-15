@@ -5,7 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import markdown
+
 
 
 
@@ -63,7 +63,7 @@ def _word_chunks(text: str, chunk_size: int, chunk_overlap: int) -> list[str]:
 def create_documents(
     sampled_df: pd.DataFrame,
     text_col: str,
-    chunk_size: int = 400,
+    chunk_size: int = 500,
     chunk_overlap: int = 100,
 ) -> list[dict]:
     if text_col not in sampled_df.columns:
