@@ -36,8 +36,7 @@ def stratified_sample(
         sampled_dfs.append(sampled)
 
     if not sampled_dfs:
-        return 
-    df.head(0).copy()
+        return df.head(0).copy()
 
     return pd.concat(sampled_dfs, ignore_index=True)
 
