@@ -10,3 +10,6 @@ logs/
 .ipynb_checkpoints/
 .pytest_cache/
 
+# Streamlit secrets (do NOT commit API keys)
+.streamlit/secrets.toml
+
