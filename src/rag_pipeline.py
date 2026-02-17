@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from pathlib import Path
-import pickle
 import os
+import pickle
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
+import openai
+from openai import OpenAI
 
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -69,7 +71,6 @@ def load_vector_store(
         ) from exc
 
     index = faiss.read_index(str(index_path))
-
     with open(metadata_path, "rb") as f:
         metadata = pickle.load(f)
 
@@ -85,16 +86,111 @@ def load_vector_store(
     return index, metadata
 
 
+class OpenAIEmbeddingModel:
+    def __init__(self, *, api_key: str, model: str = "text-embedding-3-small"):
+        if not api_key:
+            raise ValueError("api_key must be provided")
+        if not model:
+            raise ValueError("model must be provided")
+        self._client = OpenAI(api_key=api_key)
+        self._model = model
+
+    def encode(
+        self,
+        texts: list[str],
+        *,
+        convert_to_numpy: bool = True,
+        normalize_embeddings: bool = True,
+        **_kwargs,
+    ):
+        resp = self._client.embeddings.create(model=self._model, input=texts)
+        vectors = np.asarray([item.embedding for item in resp.data], dtype=np.float32)
+
+        if normalize_embeddings:
+            norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+            norms = np.where(norms == 0, 1.0, norms)
+            vectors = vectors / norms
+
+        if convert_to_numpy:
+            return vectors
+        return vectors.tolist()
+
+
+def _is_quota_error(exc: Exception) -> bool:
+    if isinstance(exc, openai.RateLimitError):
+        return True
+    msg = str(exc).lower()
+    return ("insufficient_quota" in msg) or ("exceeded your current quota" in msg) or ("error code: 429" in msg)
+
+
 def load_embedding_model(model_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
+    """Returns an embedding model with an .encode() method, or None for offline keyword-only mode.
+
+    Default backend is OpenAI (requires OPENAI_API_KEY). You can override with:
+    - RAG_EMBEDDINGS_BACKEND=openai|sentence-transformers
+    - RAG_EMBEDDING_MODEL=text-embedding-3-small
+    """
+
+    backend = os.environ.get("RAG_EMBEDDINGS_BACKEND", "openai").strip().lower()
+
+    if backend in {"openai", "oai"}:
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            return None
+        embedding_model = os.environ.get("RAG_EMBEDDING_MODEL", "text-embedding-3-small").strip()
+        if not embedding_model:
+            embedding_model = "text-embedding-3-small"
+        return OpenAIEmbeddingModel(api_key=api_key, model=embedding_model)
+
     if not isinstance(model_name, str) or not model_name.strip():
         raise ValueError("model_name must be a non-empty string")
     try:
         from sentence_transformers import SentenceTransformer
     except ImportError as exc:  # pragma: no cover
         raise ImportError(
-            "Missing dependency: sentence-transformers. Install with: pip install sentence-transformers"
+            "Missing dependency: sentence-transformers. Install with: pip install sentence-transformers, "
+            "or set RAG_EMBEDDINGS_BACKEND=openai and provide OPENAI_API_KEY."
         ) from exc
     return SentenceTransformer(model_name)
+
+
+def _tokenize(text: str) -> set[str]:
+    text = (text or "").lower()
+    tokens: list[str] = []
+    current: list[str] = []
+    for ch in text:
+        if ch.isalnum():
+            current.append(ch)
+        else:
+            if current:
+                tokens.append("".join(current))
+                current = []
+    if current:
+        tokens.append("".join(current))
+    return set(tokens)
+
+
+def keyword_retrieve_chunks(question: str, *, metadata: list[Any], top_k: int) -> list[dict[str, Any]]:
+    q_tokens = _tokenize(question)
+    if not q_tokens:
+        return []
+
+    scored: list[tuple[int, int]] = []
+    for i, item in enumerate(metadata):
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("text") or item.get("chunk_text") or "")
+        score = len(q_tokens & _tokenize(text))
+        if score > 0:
+            scored.append((score, i))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    results: list[dict[str, Any]] = []
+    for _score, idx in scored[:top_k]:
+        item = metadata[idx]
+        if isinstance(item, dict):
+            results.append(item)
+    return results
 
 
 def retrieve_chunks(
@@ -102,7 +198,7 @@ def retrieve_chunks(
     *,
     index,
     metadata: list[Any],
-    embedding_model,
+    embedding_model=None,
     top_k: int = 5,
 ) -> list[dict[str, Any]]:
     question = _validate_question(question)
@@ -113,11 +209,26 @@ def retrieve_chunks(
         raise ValueError("FAISS index contains no vectors")
     top_k = min(top_k, ntotal)
 
-    query_vec = embedding_model.encode(
-        [question],
-        convert_to_numpy=True,
-        normalize_embeddings=True,
-    ).astype(np.float32)
+    if embedding_model is None:
+        return keyword_retrieve_chunks(question, metadata=metadata, top_k=top_k)
+
+    try:
+        query_vec = embedding_model.encode(
+            [question],
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+        ).astype(np.float32)
+    except Exception as exc:
+        if _is_quota_error(exc):
+            return keyword_retrieve_chunks(question, metadata=metadata, top_k=top_k)
+        raise
+
+    index_dim = int(getattr(index, "d", 0))
+    if index_dim and int(query_vec.shape[1]) != index_dim:
+        raise ValueError(
+            f"Embedding dimension mismatch: index dim={index_dim} but query dim={int(query_vec.shape[1])}. "
+            "Rebuild the vector store with the same embedding model."
+        )
 
     _distances, indices = index.search(query_vec, top_k)
     results: list[dict[str, Any]] = []
@@ -148,9 +259,7 @@ def build_generator(
     try:
         from transformers import pipeline
     except ImportError as exc:  # pragma: no cover
-        raise ImportError(
-            "Missing dependency: transformers. Install with: pip install transformers"
-        ) from exc
+        raise ImportError("Missing dependency: transformers. Install with: pip install transformers") from exc
 
     try:
         return pipeline(
@@ -190,13 +299,7 @@ def generate_answer(
         top_k=top_k,
     )
 
-    if chunks and "text" not in chunks[0]:
-        raise ValueError(
-            "Retrieved items do not include 'text'. Your metadata.pkl appears to contain only metadata fields. "
-            "Rebuild the vector store and persist chunk text alongside metadata (e.g., save full documents)."
-        )
-
-    context_text = "\n\n".join([c.get("text", "") for c in chunks])
+    context_text = "\n\n".join([str(c.get("text") or c.get("chunk_text") or "") for c in chunks])
     prompt = PROMPT_TEMPLATE.format(context=context_text, question=question)
     output = generator(prompt, do_sample=True, temperature=float(temperature))[0]["generated_text"]
     return str(output)
@@ -213,11 +316,8 @@ def run_evaluation() -> None:
         embedding_model=embedding_model,
         top_k=1,
     )
-    if probe and "text" not in probe[0]:
-        raise ValueError(
-            "Vector store metadata does not include chunk 'text'. "
-            "Update the vector store builder to persist chunk text alongside metadata (or store a separate documents list)."
-        )
+    if probe and not (probe[0].get("text") or probe[0].get("chunk_text")):
+        raise ValueError("Vector store metadata does not include chunk text (expected 'text' or 'chunk_text').")
 
     generator = build_generator()
 
@@ -230,7 +330,6 @@ def run_evaluation() -> None:
     ]
 
     evaluation_results: list[dict[str, Any]] = []
-
     for q in questions:
         retrieved = retrieve_chunks(q, index=index, metadata=metadata, embedding_model=embedding_model)
         answer = generate_answer(
